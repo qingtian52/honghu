@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>灵动鸟群 | 纯净修复版</title>
+    <style>
+        body { 
+            margin: 0;
+            overflow: hidden; 
+            /* 深绿色到黑色的径向渐变背景 */
+            background: radial-gradient(circle at center, #001a0a 0%, #000000 100%);
+            font-family: sans-serif; 
+        }
+        #info {
+            position: absolute;
+            bottom: 20px; left: 20px;
+            background: rgba(0, 30, 20, 0.7); backdrop-filter: blur(10px);
+            padding: 12px 24px; border-radius: 40px;
+            font-size: 13px; color: #aaffaa;
+            z-index: 10;
+            border: 1px solid rgba(0, 255, 100, 0.3); pointer-events: none;
+        }
+        #status-card {
+            position: absolute;
+            top: 20px; right: 20px;
+            background: rgba(0, 0, 0, 0.4); padding: 8px 18px;
+            border-radius: 20px; color: #fff; font-size: 12px;
+            z-index: 10; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">💠 <b>sky.glb 多色汇聚系统</b><br>主色：绿色 | 动画：已激活 | 鼠标：实时排斥</div>
+    <div id="status-card"><span id="phase-text">资源加载中...</span></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // ========== 全局控制参数 ==========
+        const CONFIG = {
+            BIRD_COUNT: 7500,             // 鸟儿数量
+            WANDER_TIME: 1.5,             // 自由飞翔时间
+            FORMATION_STRENGTH: 16,        // 汇聚引力
+            BIRD_SIZE_RANGE: [1, 4], // 随机大小控制 [最小值, 最大值]
+            REPEL_RADIUS: 6.0,            // 鼠标排斥半径
+            REPEL_STRENGTH: 15.0,         // 鼠标排斥强度
+            CLICK_STRENGTH: 90.0,         // 点击冲击强度
+            BLOOM: { strength: 0.3, radius: 0.2, threshold: 0.1 }, // 辉光设置
+            MODEL_SCALE: 16.0
+        };
+
+        let scene, camera, renderer, controls, composer, clock;
+        let birds = [], targetPoints = [];
+        let mouse = new THREE.Vector3(10000, 10000, 10000);
+        let clickTime = 0, clickPos = new THREE.Vector3();
+        let startTime = 0;
+
+        const COLORS = {
+            main: 0x3fb038,    // 绿色
+            sub1: 0x8bc14b,    // 黄色
+            sub2: 0xb2d5e1     // 紫色
+        };
+
+        async function init() {
+            scene = new THREE.Scene();
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 10, 50);
+
+            const renderPass = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                CONFIG.BLOOM.strength, CONFIG.BLOOM.radius, CONFIG.BLOOM.threshold
+            );
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderPass);
+            composer.addPass(bloomPass);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+            clock = new THREE.Clock();
+            startTime = performance.now();
+
+            await loadModels();
+            
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('mousedown', onMouseDown);
+            window.addEventListener('resize', onResize);
+            
+            animate();
+        }
+
+        async function loadModels() {
+            const loader = new GLTFLoader();
+            const [skyData, birdData] = await Promise.all([
+                loader.loadAsync('skylogo4.glb'),
+                loader.loadAsync('wing6.glb')
+            ]);
+
+            // 解析 sky.glb 点云目标
+            const pts = [];
+            skyData.scene.traverse(c => {
+                if (c.isMesh) {
+                    const pos = c.geometry.attributes.position;
+                    for (let i = 0; i < pos.count; i += 2) {
+                        let v = new THREE.Vector3().fromBufferAttribute(pos, i);
+                        v.applyMatrix4(c.matrixWorld);
+                        pts.push(v);
+                    }
+                }
+            });
+            const box = new THREE.Box3().setFromPoints(pts);
+            const center = box.getCenter(new THREE.Vector3());
+            const scale = CONFIG.MODEL_SCALE / box.getSize(new THREE.Vector3()).length();
+            targetPoints = pts.map(p => p.sub(center).multiplyScalar(scale));
+
+            // 创建鸟群
+            for (let i = 0; i < CONFIG.BIRD_COUNT; i++) {
+                const group = new THREE.Group();
+                const clone = birdData.scene.clone();
+                
+                // 1. 设置随机大小
+                const s = CONFIG.BIRD_SIZE_RANGE[0] + Math.random() * (CONFIG.BIRD_SIZE_RANGE[1] - CONFIG.BIRD_SIZE_RANGE[0]);
+                clone.scale.set(s, s, s);
+
+                // 2. 随机颜色分配
+                let targetColor = Math.random() < 0.6 ? COLORS.main : (Math.random() < 0.5 ? COLORS.sub1 : COLORS.sub2);
+                const materialColor = new THREE.Color(targetColor);
+
+                clone.traverse(child => {
+                    if (child.isMesh) {
+                        child.material = new THREE.MeshStandardMaterial({
+                            color: materialColor,
+                            emissive: materialColor,
+                            emissiveIntensity: 2.0,
+                            metalness: 0.5,
+                            roughness: 0.2
+                        });
+                    }
+                });
+
+                // 3. 设置动画播放器
+                let mixer = null;
+                if (birdData.animations && birdData.animations.length > 0) {
+                    mixer = new THREE.AnimationMixer(clone);
+                    const action = mixer.clipAction(birdData.animations[0]);
+                    action.play();
+                    mixer.setTime(Math.random() * 2); // 随机错开动画进度
+                }
+
+                group.add(clone);
+                group.position.set((Math.random()-0.5)*70, (Math.random()-0.5)*70, (Math.random()-0.5)*70);
+                scene.add(group);
+
+                birds.push({
+                    mesh: group,
+                    mixer: mixer,
+                    velocity: new THREE.Vector3((Math.random()-0.5)*15, (Math.random()-0.5)*15, (Math.random()-0.5)*15),
+                    target: targetPoints[i % targetPoints.length],
+                    seed: Math.random() * 100
+                });
+            }
+        }
+
+        function onMouseMove(e) {
+            const x = (e.clientX / window.innerWidth) * 2 - 1;
+            const y = -(e.clientY / window.innerHeight) * 2 + 1;
+            const vector = new THREE.Vector3(x, y, 0.5).unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const dist = -camera.position.z / dir.z;
+            mouse.copy(camera.position).add(dir.multiplyScalar(dist));
+        }
+
+        function onMouseDown() {
+            clickTime = performance.now();
+            clickPos.copy(mouse);
+        }
+
+        function updatePhysics(dt) {
+            const now = performance.now();
+            const elapsed = (now - startTime) / 1000;
+            let formationWeight = Math.max(0, Math.min(1, (elapsed - CONFIG.WANDER_TIME) / 1.5));
+
+            birds.forEach((b) => {
+                // 更新动画
+                if (b.mixer) b.mixer.update(dt);
+
+                const acc = new THREE.Vector3();
+                acc.x += Math.sin(now * 0.001 + b.seed) * 3 * (1.0 - formationWeight * 0.8);
+                acc.y += Math.cos(now * 0.0012 + b.seed) * 3 * (1.0 - formationWeight * 0.8);
+
+                if (formationWeight > 0) {
+                    const toTarget = new THREE.Vector3().subVectors(b.target, b.mesh.position);
+                    acc.add(toTarget.multiplyScalar(CONFIG.FORMATION_STRENGTH * formationWeight));
+                }
+
+                const distToMouse = b.mesh.position.distanceTo(mouse);
+                if (distToMouse < CONFIG.REPEL_RADIUS) {
+                    const repel = new THREE.Vector3().subVectors(b.mesh.position, mouse);
+                    acc.add(repel.normalize().multiplyScalar(CONFIG.REPEL_STRENGTH * (1.0 - distToMouse/CONFIG.REPEL_RADIUS)));
+                }
+
+                if (now - clickTime < 350) {
+                    const distToClick = b.mesh.position.distanceTo(clickPos);
+                    if (distToClick < 18) {
+                        const pulse = new THREE.Vector3().subVectors(b.mesh.position, clickPos);
+                        acc.add(pulse.normalize().multiplyScalar(CONFIG.CLICK_STRENGTH));
+                    }
+                }
+
+                b.velocity.add(acc.multiplyScalar(dt));
+                b.velocity.multiplyScalar(formationWeight > 0.9 ? 0.82 : 0.95);
+                b.mesh.position.add(b.velocity.clone().multiplyScalar(dt));
+
+                if (b.velocity.length() > 0.1) {
+                    b.mesh.lookAt(b.mesh.position.clone().add(b.velocity));
+                }
+            });
+
+            const status = document.getElementById('phase-text');
+            if (formationWeight <= 0) status.innerText = "状态：自由飞翔";
+            else if (formationWeight < 1) status.innerText = "状态：构筑 sky.glb 中...";
+            else status.innerText = "状态：已汇聚至 sky.glb (支持实时交互)";
+        }
+
+        function animate() {
+            const dt = Math.min(clock.getDelta(), 0.033);
+            updatePhysics(dt);
+            controls.update();
+            composer.render();
+            requestAnimationFrame(animate);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        init();
+    </script>
+</body>
+</html>
